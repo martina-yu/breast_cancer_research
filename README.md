@@ -1,1 +1,3 @@
 # breast_cancer_research
+
+Phosphatidylinositol 3-kinase/AKT-serine threonine kinase/mammalian target of rapamycin (mTOR) pathway abnormalities contribute to endocrine resistance. Everolimus, an mTOR inhibitor, improved progression-free survival in hormone receptor–positive metastatic breast cancer (BC) when combined with endocrine therapy (ET). In this phase III randomized, placebo-controlled trial, we assessed the efficacy of everolimus 1 ET as adjuvant therapy in high-risk, hormone receptor–positive, human epidermal growth factor receptor 2negative BC after adjuvant/neoadjuvant chemotherapy.
