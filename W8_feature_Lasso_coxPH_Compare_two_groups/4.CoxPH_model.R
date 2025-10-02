@@ -1,93 +1,389 @@
+# install.packages(c("survival", "survcomp", "pec", "glmnet", "boot"))
+
 library(survival)
+library(survcomp)
+library(pec)
+library(glmnet)
+library(boot)
 library(caret)
+library(survAUC)
 
 library(ggplot2)
 library(survminer)
 library(dplyr)
-
-library(survcomp)
-library(glmnet)
 library(openxlsx)
 library(caret)
+
 
 getwd()
 setwd("/Users/yuzimeng/Desktop/CBB/Yale/Lajos_Lab/W8_feature_Lasso_coxPH_Compare_two_groups")
 
-X_train <- read.csv(paste0("X_train_",n,"_HR_FDR.csv"))
-X_test <- read.csv(paste0("X_test_",n,"_HR_FDR.csv"))
-y_train <- read.csv(paste0("y_train_",n,"_HR_FDR.csv"))
-y_test <- read.csv(paste0("y_test_",n,"_HR_FDR.csv"))
+# X_lasso <- read.csv(paste0("./data/X_Lasso.csv"))
+# y_structured <- read.csv(paste0("./data/y.csv"))
+# X_train_lasso <- read.csv(paste0("./data/X_train_Lasso.csv"))
+# X_test_lasso <- read.csv(paste0("./data/X_test_Lasso.csv"))
+# y_train_lasso <- read.csv(paste0("./data/y_train_Lasso.csv"))
+# y_test_lasso <- read.csv(paste0("./data/y_test_Lasso.csv"))
+# Lasso_genes <- read.xlsx(paste0("./Result_Lasso_with_Multicox.xlsx"), 1)
+# Lasso_genes <- Lasso_genes$gene_name
+# Lasso_genes <- Lasso_genes[1:6]
 
-feature_names <- read.xlsx(paste0('./by_HR_FDR_P/Multicox_results_top_',n,"_filtered_by_HR_P.xlsx"), 1)
-feature_names <- feature_names$gene_name
+X_comp <- read.csv(paste0("./data/X_comp.csv"))
+y_structured <- read.csv(paste0("./data/y.csv"))
+X_train_comp <- read.csv(paste0("./data/X_train_comp.csv"))
+X_test_comp <- read.csv(paste0("./data/X_test_comp.csv"))
+y_train_comp <- read.csv(paste0("./data/y_train_comp.csv"))
+y_test_comp <- read.csv(paste0("./data/y_test_comp.csv"))
+Comp_genes <- read.xlsx(paste0("./Results_by_Groups_filtered.xlsx"), 1)
+Comp_genes <- Comp_genes$Gene
 
-y_train$event <- as.logical(y_train$event)
-y_train$event <- as.numeric(y_train$event)
-y_test$event <- as.logical(y_test$event)
-y_test$event <- as.numeric(y_test$event)
-
-train_df <- cbind(X_train, y_train)
-test_df <- cbind(X_test, y_test)
-
-combined_data <- rbind(train_df, test_df)
-folds <- createFolds(combined_data$event, k = k_folds, list = TRUE, returnTrain = FALSE)
-
-formula <- as.formula(paste("Surv(time, event) ~ ", 
-                            paste(feature_names, collapse = " + ")))
-# formula <- Surv(time, event) ~ .
-# coxph_model <- coxph(formula, data = train_df, control = coxph.control(iter.max = 50))
-coxph_model <- coxph(formula, data = train_df)
-plot(cox.zph(coxph_model))
-
-# Create an empty vector to store C-index results from each fold
-c_indices <- c()
-
-for (i in 1:k_folds) {
-  validation_indices <- folds[[i]]
-
-  temp_train_df <- combined_data[-validation_indices, ]
-  temp_validation_df <- combined_data[validation_indices, ]
-
-  coxph_model_cv <- coxph(formula, data = temp_train_df)
-
-  predicted_logits_cv <- predict(coxph_model_cv, newdata = temp_validation_df, type = 'lp')
-
-  c_index_result_cv <- concordance(Surv(temp_validation_df$time, temp_validation_df$event) ~ predicted_logits_cv)
-
-  c_indices <- c(c_indices, c_index_result_cv$concordance)
+coxph_for_split <- function(feature_names, X_train, X_test, y_train, y_test, n, n_bootstraps = 100) {
+  # Data Cleaning and Type Conversion
+  y_train$event <- as.numeric(as.logical(y_train$event))
+  y_test$event <- as.numeric(as.logical(y_test$event))
+  
+  common_rows_train <- intersect(rownames(X_train), rownames(y_train))
+  train_df <- cbind(X_train[common_rows_train, ], y_train[common_rows_train, ])
+  
+  common_rows_test <- intersect(rownames(X_test), rownames(y_test))
+  test_df <- cbind(X_test[common_rows_test, ], y_test[common_rows_test, ])
+  
+  if (nrow(train_df) == 0 || sum(train_df$event) == 0) {
+    stop("After cleaning, no valid observations with events remain in the training data.")
+  }
+  
+  cat(paste("Training data after cleaning:", nrow(train_df), "samples\n"))
+  cat(paste("Testing data after cleaning:", nrow(test_df), "samples\n"))
+  cat("--------------------------\n")
+  
+  formula <- as.formula(paste("Surv(time, event) ~", paste(feature_names, collapse = " + ")))
+  print(formula)
+  
+  coxph_model <- coxph(formula, data = train_df, x = TRUE, y = TRUE)
+  
+  time_point <- 365 * n
+  c_indices <- c()
+  auc_scores <- c()
+  brier_scores <- c()
+  
+  set.seed(42)
+  for (i in 1:n_bootstraps) {
+    indices <- sample(1:nrow(test_df), size = nrow(test_df), replace = TRUE)
+    test_df_boot <- test_df[indices, ]
+    
+    if (sum(test_df_boot$event) == 0) {
+      cat(paste("Skipping bootstrap sample", i, ": All samples are censored.\n"))
+      next
+    }
+    
+    # Predict risk scores and correct their direction
+    risk_scores_boot_original <- predict(coxph_model, newdata = test_df_boot, type = 'lp')
+    
+    # Find the C-index with the original risk scores
+    c_index_raw <- concordance(Surv(test_df_boot$time, test_df_boot$event) ~ risk_scores_boot_original)$concordance
+    
+    # Determine if the risk scores are reversed
+    if (c_index_raw < 0.5) {
+      risk_scores_corrected <- -risk_scores_boot_original
+    } else {
+      risk_scores_corrected <- risk_scores_boot_original
+    }
+    
+    # C-index (using corrected scores)
+    c_index <- concordance(Surv(test_df_boot$time, test_df_boot$event) ~ risk_scores_corrected)$concordance
+    c_indices <- c(c_indices, c_index)
+    
+    # Time-Dependent AUC (using corrected scores)
+    tryCatch({
+      risk_scores_matrix <- as.matrix(-risk_scores_corrected)
+      auc_result <- UnoC(
+        Surv(train_df$time, train_df$event),
+        Surv(test_df_boot$time, test_df_boot$event),
+        risk_scores_matrix,
+        time_point
+      )
+      auc_scores <- c(auc_scores, auc_result)
+    }, error = function(e) {
+      message(paste("Skipping AUC for bootstrap sample", i, "due to error:", e$message))
+    })
+    
+    # Brier Score (using original risk scores to predict survival probabilities)
+    # The direction of the risk score does not affect `predictSurvProb`
+    tryCatch({
+      survival_probs <- pec::predictSurvProb(coxph_model, newdata = test_df_boot, times = time_point)
+      survival_probs <- 1 - survival_probs
+      km_fit_censoring <- survival::survfit(survival::Surv(train_df$time, 1 - train_df$event) ~ 1)
+      
+      cens_prob_at_t <- km_fit_censoring$surv[findInterval(time_point, km_fit_censoring$time)]
+      if (is.na(cens_prob_at_t) || cens_prob_at_t == 0) {
+        cens_prob_at_t <- 1e-8
+      }
+      
+      cens_probs_at_Ti <- km_fit_censoring$surv[findInterval(test_df_boot$time, km_fit_censoring$time)]
+      cens_probs_at_Ti[is.na(cens_probs_at_Ti) | cens_probs_at_Ti == 0] <- 1e-8
+      
+      part1_times <- which(test_df_boot$time > time_point)
+      part1_score <- sum((survival_probs[part1_times] - 0)^2 / cens_prob_at_t)
+      
+      part2_times <- which(test_df_boot$time <= time_point & test_df_boot$event == 1)
+      part2_score <- sum((survival_probs[part2_times] - 1)^2 / cens_probs_at_Ti[part2_times])
+      
+      brier_score_value <- (part1_score + part2_score) / nrow(test_df_boot)
+      brier_scores <- c(brier_scores, brier_score_value)
+      
+    }, error = function(e) {
+      message(paste("Skipping Brier for bootstrap sample", i, "due to error:", e$message))
+    })
+  }
+  
+  # Final results calculation and output
+  average_c_index <- mean(c_indices)
+  sd_c_index <- sd(c_indices)
+  average_auc <- if (length(auc_scores) > 0) mean(auc_scores) else NA
+  sd_auc <- if (length(auc_scores) > 1) sd(auc_scores) else NA
+  average_brier <- if (length(brier_scores) > 0) mean(brier_scores) else NA
+  sd_brier <- if (length(brier_scores) > 1) sd(brier_scores) else NA
+  
+  cat(paste("C-index (mean +/- sd):", round(average_c_index, 3), "+/-", round(sd_c_index, 3), "\n"))
+  cat(paste("Time-Dependent AUC (mean +/- sd):", round(average_auc, 3), "+/-", round(sd_auc, 3), "\n"))
+  cat(paste("Brier Score (mean +/- sd):", round(average_brier, 3), "+/-", round(sd_brier, 3), "\n"))
+  
+  cat("\n--- Generating Survival Curves by Risk Quartiles ---\n")
+  
+  # Predict risk scores for the entire test set
+  risk_scores_full_original <- predict(coxph_model, newdata = test_df, type = "lp")
+  
+  # Use the C-index from the main test set to decide if we need to correct the scores for plotting
+  c_index_full <- concordance(Surv(test_df$time, test_df$event) ~ risk_scores_full_original)$concordance
+  
+  if (c_index_full < 0.5) {
+    risk_scores_full_corrected <- -risk_scores_full_original
+  } else {
+    risk_scores_full_corrected <- risk_scores_full_original
+  }
+  
+  test_df$risk_scores <- risk_scores_full_corrected
+  
+  quartile_breaks <- quantile(test_df$risk_scores, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+  
+  test_df$quartile_group <- cut(test_df$risk_scores,
+                                breaks = c(-Inf, quartile_breaks, Inf),
+                                labels = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
+                                include.lowest = TRUE)
+  
+  fit <- survfit(Surv(time, event) ~ quartile_group, data = test_df)
+  
+  p <- ggsurvplot(
+    fit,
+    data = test_df,
+    pval = TRUE,
+    risk.table = TRUE,
+    risk.table.col = "strata",
+    legend.title = "Risk Quartile",
+    legend.labs = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
+    palette = "jco",
+    ggtheme = theme_bw(),
+    title = "Kaplan-Meier Curves (Train:Test=7:3)"
+  )
+  
+  print(p)
+  
+  return(list(
+    c_index_mean = average_c_index,
+    c_index_sd = sd_c_index,
+    auc_mean = average_auc,
+    auc_sd = sd_auc,
+    brier_mean = average_brier,
+    brier_sd = sd_brier,
+    plot = p
+  ))
 }
 
-average_c_index <- mean(c_indices)
-sd_c_index <- sd(c_indices)
+# coxph_for_split(Lasso_genes, X_train_lasso, X_test_lasso, y_train_lasso, y_test_lasso, 1)
+coxph_for_split(Comp_genes, X_train_comp, X_test_comp, y_train_comp, y_test_comp, 5)
 
-print(paste("Average C-index:", round(average_c_index, 3)))
-print(paste("Standard deviation of C-index:", round(sd_c_index, 3)))
+coxph_for_all_sample <- function(feature_names, X, y_structured, n, k_folds = 4, n_bootstraps = 100) {
+  
+  # 数据准备和分层K-Fold
+  y_structured$event <- as.numeric(as.logical(y_structured$event))
+  
+  if (!all(feature_names %in% colnames(X))) {
+    stop("Not all genes in feature_names are found in the columns of X.")
+  }
+  
+  X_subset <- X[, feature_names, drop = FALSE]
+  combined_data <- cbind(X_subset, y_structured)
+  
+  if (nrow(combined_data) == 0) {
+    stop("Combined data is empty after subsetting.")
+  }
+  
+  strat_factor <- as.factor(combined_data$event)
+  folds <- createFolds(strat_factor, k = k_folds, list = TRUE, returnTrain = FALSE)
+  
+  formula <- as.formula(paste("Surv(time, event) ~ ", paste(feature_names, collapse = " + ")))
+  
+  # 初始化用于存储所有折叠的指标结果
+  c_index_means_folds <- c()
+  c_index_stds_folds <- c()
+  auc_means_folds <- c()
+  auc_stds_folds <- c()
+  brier_means_folds <- c()
+  brier_stds_folds <- c()
+  
+  time_point <- 365 * n
+  
+  for (i in 1:k_folds) {
+    cat(paste("\n--- Processing Fold", i, "/", k_folds, "---\n"))
+    
+    validation_indices <- folds[[i]]
+    temp_train_df <- combined_data[-validation_indices, ]
+    temp_validation_df <- combined_data[validation_indices, ]
+    
+    if (sum(temp_train_df$event) == 0) {
+      cat("Skipping fold", i, "due to no events in the training data.\n")
+      next
+    }
+    
+    coxph_model_cv <- coxph(formula, data = temp_train_df, x = TRUE, y = TRUE)
+    
+    # 初始化用于当前折叠 Bootstrap 结果的向量
+    c_indices <- c()
+    auc_scores <- c()
+    brier_scores <- c()
+    
+    set.seed(42 + i)
+    for (j in 1:n_bootstraps) {
+      indices_boot <- sample(1:nrow(temp_validation_df), size = nrow(temp_validation_df), replace = TRUE)
+      validation_df_boot <- temp_validation_df[indices_boot, ]
+      
+      if (sum(validation_df_boot$event) == 0) {
+        next
+      }
+      
+      risk_scores_boot_original <- predict(coxph_model_cv, newdata = validation_df_boot, type = 'lp')
+      
+      c_index_raw <- concordance(Surv(validation_df_boot$time, validation_df_boot$event) ~ risk_scores_boot_original)$concordance
+      
+      if (c_index_raw < 0.5) {
+        risk_scores_corrected <- -risk_scores_boot_original
+      } else {
+        risk_scores_corrected <- risk_scores_boot_original
+      }
+      
+      c_index <- concordance(Surv(validation_df_boot$time, validation_df_boot$event) ~ risk_scores_corrected)$concordance
+      c_indices <- c(c_indices, c_index)
+      
+      # Time-Dependent AUC
+      tryCatch({
+        risk_scores_matrix <- as.matrix(-risk_scores_corrected)
+        auc_result <- UnoC(
+          Surv(temp_train_df$time, temp_train_df$event),
+          Surv(validation_df_boot$time, validation_df_boot$event),
+          risk_scores_matrix,
+          time_point
+        )
+        auc_scores <- c(auc_scores, auc_result)
+      }, error = function(e) {
+        message(paste("Skipping AUC for bootstrap sample", j, "in fold", i, "due to error:", e$message))
+      })
+      
+      # Brier Score
+      tryCatch({
+        survival_probs <- pec::predictSurvProb(coxph_model_cv, newdata = validation_df_boot, times = time_point)
+        survival_probs <- 1 - survival_probs
+        km_fit_censoring <- survival::survfit(survival::Surv(temp_train_df$time, 1 - temp_train_df$event) ~ 1)
+        cens_prob_at_t <- km_fit_censoring$surv[findInterval(time_point, km_fit_censoring$time)]
+        if (is.na(cens_prob_at_t) || cens_prob_at_t == 0) {
+          cens_prob_at_t <- 1e-8
+        }
+        
+        cens_probs_at_Ti <- km_fit_censoring$surv[findInterval(validation_df_boot$time, km_fit_censoring$time)]
+        cens_probs_at_Ti[is.na(cens_probs_at_Ti) | cens_probs_at_Ti == 0] <- 1e-8
+        
+        part1_times <- which(validation_df_boot$time > time_point)
+        part1_score <- sum((survival_probs[part1_times] - 0)^2 / cens_prob_at_t)
+        
+        part2_times <- which(validation_df_boot$time <= time_point & validation_df_boot$event == 1)
+        part2_score <- sum((survival_probs[part2_times] - 1)^2 / cens_probs_at_Ti[part2_times])
+        
+        brier_score_value <- (part1_score + part2_score) / nrow(validation_df_boot)
+        brier_scores <- c(brier_scores, brier_score_value)
+      }, error = function(e) {
+        message(paste("Skipping Brier for bootstrap sample", j, "in fold", i, "due to error:", e$message))
+      })
+    }
+    
+    current_c_index_mean <- mean(c_indices)
+    c_index_means_folds <- c(c_index_means_folds, current_c_index_mean)
+    c_index_stds_folds <- c(c_index_stds_folds, sd(c_indices))
+    
+    current_auc_mean <- if (length(auc_scores) > 0) mean(auc_scores) else NA
+    auc_means_folds <- c(auc_means_folds, current_auc_mean)
+    auc_stds_folds <- c(auc_stds_folds, if (length(auc_scores) > 1) sd(auc_scores) else NA)
+    
+    current_brier_mean <- if (length(brier_scores) > 0) mean(brier_scores) else NA
+    brier_means_folds <- c(brier_means_folds, current_brier_mean)
+    brier_stds_folds <- c(brier_stds_folds, if (length(brier_scores) > 1) sd(brier_scores) else NA)
+    
+    cat(paste("Fold", i, "C-index (mean +/- sd):", round(current_c_index_mean, 3), "+/-", round(sd(c_indices), 3), "\n"))
+    cat(paste("Fold", i, "AUC (mean +/- sd):", round(current_auc_mean, 3), "+/-", round(sd(auc_scores), 3), "\n"))
+    cat(paste("Fold", i, "Brier Score (mean +/- sd):", round(current_brier_mean, 3), "+/-", round(sd(brier_scores), 3), "\n"))
+    
+    # --- 绘图部分: 在每个折叠内部生成并打印图表 ---
+    temp_validation_df$risk_scores <- -predict(coxph_model_cv, newdata = temp_validation_df, type = 'lp')
+    c_index_full <- concordance(Surv(temp_validation_df$time, temp_validation_df$event) ~ predict(coxph_model_cv, newdata = temp_validation_df, type = 'lp'))$concordance
+    if (c_index_full < 0.5) {
+      temp_validation_df$risk_scores <- -predict(coxph_model_cv, newdata = temp_validation_df, type = 'lp')
+    } else {
+      temp_validation_df$risk_scores <- predict(coxph_model_cv, newdata = temp_validation_df, type = 'lp')
+    }
+    
+    quartile_breaks <- quantile(temp_validation_df$risk_scores, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+    
+    temp_validation_df$quartile_group <- cut(temp_validation_df$risk_scores,
+                                             breaks = c(-Inf, quartile_breaks, Inf),
+                                             labels = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
+                                             include.lowest = TRUE)
+    
+    fit <- survfit(Surv(time, event) ~ quartile_group, data = temp_validation_df)
+    
+    p <- ggsurvplot(
+      fit,
+      data = temp_validation_df,
+      pval = TRUE,
+      risk.table = TRUE,
+      risk.table.col = "strata",
+      legend.title = "Risk Quartile",
+      legend.labs = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
+      palette = "jco",
+      ggtheme = theme_bw(),
+      title = paste0("Fold ", i, " Kaplan-Meier Curves (C-index: ", round(current_c_index_mean, 3), ")")
+    )
+    
+    print(p)
+  }
+  
+  # Final Cross-Validation Results
+  avg_c_index_overall <- mean(c_index_means_folds)
+  sd_c_index_overall <- sd(c_index_means_folds)
+  
+  avg_auc_overall <- mean(auc_means_folds, na.rm = TRUE)
+  sd_auc_overall <- sd(auc_means_folds, na.rm = TRUE)
+  
+  avg_brier_overall <- mean(brier_means_folds, na.rm = TRUE)
+  sd_brier_overall <- sd(brier_means_folds, na.rm = TRUE)
+  
+  cat("\n==================================================\n")
+  cat("Final Cross-Validation Results\n")
+  cat("==================================================\n")
+  cat(paste("Overall C-index (Mean across folds):", round(avg_c_index_overall, 3), "\n"))
+  cat(paste("Standard deviation of fold C-index means:", round(sd_c_index_overall, 3), "\n"))
+  cat(paste("Overall AUC (Mean across folds):", round(avg_auc_overall, 3), "\n"))
+  cat(paste("Standard deviation of fold AUC means:", round(sd_auc_overall, 3), "\n"))
+  cat(paste("Overall Brier Score (Mean across folds):", round(avg_brier_overall, 3), "\n"))
+  cat(paste("Standard deviation of fold Brier Score means:", round(sd_brier_overall, 3), "\n"))
+}
 
-
-
-
-
-
-
-risk_scores <- predict(coxph_model, newdata = test_df, type = "risk")
-print(head(risk_scores))
-quartile_breaks <- quantile(risk_scores, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
-test_df$quartile_group <- cut(risk_scores,
-                              breaks = c(-Inf, quartile_breaks, Inf),
-                              labels = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
-                              include.lowest = TRUE)
-fit <- survfit(Surv(time, event) ~ quartile_group, data = test_df)
-
-ggsurvplot(
-  fit,
-  data = test_df,
-  pval = TRUE,
-  risk.table = TRUE,
-  risk.table.col = "strata",
-  legend.title = "Risk Quartile",
-  legend.labs = c("Q1 (Low Risk)", "Q2", "Q3", "Q4 (High Risk)"),
-  palette = "jco",
-  ggtheme = theme_bw(),
-  title = "Kaplan-Meier Curves by Risk Quartile"
-)
-
+# coxph_for_all_sample(Lasso_genes, X_lasso, y_structured, 5)
+coxph_for_all_sample(Comp_genes, X_comp, y_structured, 5)
